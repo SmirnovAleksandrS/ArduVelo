@@ -4,59 +4,84 @@
 #include <esp_netif.h>
 #include <esp_log.h>
 
-// Глобальный указатель на характеристику Heart Rate Measurement
+// —————————————————————————————————————————————————————————————————
+//  Глобальные объекты и флаги
+// —————————————————————————————————————————————————————————————————
 static NimBLECharacteristic* pHrChar;
+static NimBLEServer*        pServer    = nullptr;
+static NimBLEAdvertising*   pAdv       = nullptr;
+static bool                 isPromotion = false;  // если true — реклама всегда включена
 
-// Колбэки сервера для управления безопасностью и рекламой
+// —————————————————————————————————————————————————————————————————
+//  Функция обновления параметров (вызывайте её при смене флага)
+// —————————————————————————————————————————————————————————————————
+void updateParams(bool promotion) {
+  isPromotion = promotion;
+  
+  if (isPromotion) {
+    pAdv->start();
+  } else {
+    if (pServer->getConnectedCount() > 0) {
+      pAdv->stop();
+    } else {
+      pAdv->start();
+    }
+  }
+}
+
+// —————————————————————————————————————————————————————————————————
+//  Колбэки сервера для безопасности и рекламы
+// —————————————————————————————————————————————————————————————————
 class SecurityCallbacks : public NimBLEServerCallbacks {
 public:
-  // Показываем PIN на Serial для ввода на клиенте
   uint32_t onPassKeyDisplay() override {
     uint32_t passkey = NimBLEDevice::getSecurityPasskey();
-    Serial.printf(">>> Passkey: %06u\n", passkey);
     return passkey;
   }
-  // Клиент ввёл PIN — подтверждаем
+
   void onConfirmPassKey(NimBLEConnInfo &connInfo, uint32_t passkey) override {
-    Serial.printf(">>> Client entered PIN %06u – accepting\n", passkey);
     NimBLEDevice::injectConfirmPasskey(connInfo, true);
   }
-  // После окончания процедуры аутентификации
+
   void onAuthenticationComplete(NimBLEConnInfo &connInfo) override {
-    Serial.println(">>> Pairing & encryption complete");
   }
-  // Остановка рекламы при подключении клиента
-  void onConnect(NimBLEServer* pServer, NimBLEConnInfo &connInfo) override {
-    Serial.println("Client connected → stopping advertising");
-    pServer->stopAdvertising();
+
+  void onConnect(NimBLEServer* server, NimBLEConnInfo &connInfo) override {
+    // Если promotion == false — останавливаем рекламу, иначе оставляем включённой
+    if (!isPromotion) {
+      server->stopAdvertising();
+    } else {
+    }
   }
-  // Возобновление рекламы при отключении клиента
-  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo &connInfo, int reason) override {
-    Serial.println("Client disconnected → resuming advertising");
-    pServer->startAdvertising();
+
+  void onDisconnect(NimBLEServer* server, NimBLEConnInfo &connInfo, int reason) override {
+    // Если promotion == false — запускаем рекламу, иначе оставляем включённой
+    if (!isPromotion) {
+      server->startAdvertising();
+    }
   }
 };
 
-// Колбэки характеристики для контроля подписки
+// —————————————————————————————————————————————————————————————————
+//  Колбэки характеристики для контроля подписки
+// —————————————————————————————————————————————————————————————————
 class HrCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
 public:
-  // Вызывается при попытке (отписке/подписке) клиента
   void onSubscribe(NimBLECharacteristic* pCharacteristic,
                    NimBLEConnInfo &connInfo,
                    uint16_t subValue) override {
-    Serial.printf("Subscription change: 0x%04X\n", subValue);
-    // Если клиент пытается подписаться и связь не зашифрована — разрываем
     if (subValue != 0 && !connInfo.isEncrypted()) {
-      Serial.println("Subscription on unencrypted link → disconnecting client");
       NimBLEDevice::getServer()->disconnect(connInfo);
     }
   }
 };
 
+// —————————————————————————————————————————————————————————————————
+//  setup() и loop()
+// —————————————————————————————————————————————————————————————————
 void setup() {
-  Serial.begin(115200);
 
-  // Отключаем Wi-Fi для освобождения радиомодуля
+  // Отключаем Wi-Fi/Netif
   esp_wifi_stop();
   esp_wifi_deinit();
   esp_netif_deinit();
@@ -68,53 +93,60 @@ void setup() {
   // Инициализация BLE
   NimBLEDevice::init("HeartRateSensor");
 
-  // Включаем bonding + MITM(PIN) + Secure Connections
-  NimBLEDevice::setSecurityAuth(/*bonding*/true, /*MITM*/true, /*SC*/true);
+  // Настройка безопасности: bonding + MITM (PIN) + Secure Connections
+  NimBLEDevice::setSecurityAuth(true, true, true);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
   NimBLEDevice::setSecurityPasskey(123456);
 
-  // Создаём сервер и назначаем ему колбэки безопасности
-  NimBLEServer* pServer = NimBLEDevice::createServer();
+  // Создаём сервер и колбэки
+  pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new SecurityCallbacks());
-  // Отключаем автоматическую рекламу при дисконнекте,
-  // т.к. мы вручную перезапускаем рекламу в onDisconnect
-  pServer->advertiseOnDisconnect(false);
+  pServer->advertiseOnDisconnect(false);  // рекл. контроль вручную
 
-  // Создаём сервис Heart Rate (UUID 0x180D)
+  // Создаём Heart Rate Service
   NimBLEService* pService = pServer->createService("180D");
 
-  // Создаём характеристику Heart Rate Measurement (0x2A37),
-  // требующую шифрования для чтения/записи и поддерживающую уведомления
+  // Создаём характеристику HR Measurement
   pHrChar = pService->createCharacteristic(
     "2A37",
     NIMBLE_PROPERTY::NOTIFY    |
     NIMBLE_PROPERTY::READ_ENC  |
     NIMBLE_PROPERTY::WRITE_ENC
   );
-  // Назначаем колбэки характеристики для защиты подписки
   pHrChar->setCallbacks(new HrCharacteristicCallbacks());
 
-  // Запускаем сервис
   pService->start();
 
-  // Настраиваем и запускаем рекламу
-  NimBLEAdvertising* pAdv = pServer->getAdvertising();
-  pAdv->setAppearance(0x0341);         // Heart Rate Sensor
+  // Настраиваем рекламу
+  pAdv = pServer->getAdvertising();
+  pAdv->setAppearance(0x0341);
   pAdv->addServiceUUID("180D");
   pAdv->setName("HeartRateSensor");
-  pAdv->setAdvertisingInterval(1600);  // 1600 * 0.625 мс = 1 секунда
+  pAdv->setAdvertisingInterval(1600);  // ≈1 секунда
   pAdv->start();
+
+  // Изначально promotion выключён
+  isPromotion = false;
 }
 
 void loop() {
   static uint8_t bpm = 70;
-  uint8_t hrData[2] = { 0x00, bpm++ };  // флаг 0x00 + значение bpm
+  uint8_t hrData[2] = { 0x00, bpm++ };
   if (bpm > 100) bpm = 70;
 
-  // Отправляем уведомление только при наличии подключённого клиента
-  if (NimBLEDevice::getServer()->getConnectedCount() > 0) {
+  // Отправка уведомлений только при наличии подключённых клиентов
+  if (pServer->getConnectedCount() > 0) {
     pHrChar->setValue(hrData, sizeof(hrData));
     pHrChar->notify();
   }
+
+  // Здесь можно проверять внешние события и вызывать updateParams(),
+  // например, по Serial-команде:
+  // if (Serial.available()) {
+  //   char c = Serial.read();
+  //   if (c == '1') updateParams(true);
+  //   if (c == '0') updateParams(false);
+  // }
+
   delay(1000);
 }
